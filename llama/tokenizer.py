@@ -65,4 +65,17 @@ class Tokenizer:
         Returns:
             str: The decoded string.
         """
-        return self.sp_model.decode(t)
+        #return self.sp_model.decode(t)
+        return self.sp_model.decode(list(filter(lambda tk: tk != -1, t)))
+
+    def decodeIds(self, t: List[int]) -> str:
+        """
+        Decodes a list of token IDs into a string preserving the leading space.
+
+        Args:
+            t (List[int]): The list of token IDs to be decoded.
+
+        Returns:
+            str: The decoded string containing the leading space.
+        """
+        return self.sp_model.IdToPiece(list(filter(lambda tk: tk != -1, t)))

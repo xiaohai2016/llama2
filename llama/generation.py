@@ -19,6 +19,17 @@ from fairscale.nn.model_parallel.initialize import (
 from llama.model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
 
+# Use MPS on M1/M2 laptop, and use CUDA when available
+use_cpu = int(os.environ.get("USE_CPU", 0))
+if use_cpu:
+    device = torch.device('cpu')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+elif torch.cuda.is_available():
+    device = torch.device('cuda')
+else:
+    device = torch.device('cpu')
+
 Role = Literal["system", "user", "assistant"]
 
 
@@ -82,14 +93,18 @@ class Llama:
 
         """
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
+            if device == 'cuda':
+                torch.distributed.init_process_group("nccl")
+            else:
+                torch.distributed.init_process_group("gloo")
         if not model_parallel_is_initialized():
             if model_parallel_size is None:
                 model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
+        if device == 'cuda':
+            torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
         torch.manual_seed(seed)
@@ -115,9 +130,14 @@ class Llama:
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
-        torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        if use_cpu == 0:
+            if device == 'cuda':
+                torch.set_default_tensor_type(torch.cuda.HalfTensor)
+            else:
+                torch.set_default_tensor_type(torch.HalfTensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        model.to(device)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -125,6 +145,21 @@ class Llama:
     def __init__(self, model: Transformer, tokenizer: Tokenizer):
         self.model = model
         self.tokenizer = tokenizer
+
+        # For computing stats of the system performance
+        self.smoothing_factor = 0.9
+        self.in_toks_ps = None
+        self.out_toks_ps = None
+
+    def update_inference_speed(self, is_in: bool, cur_speed: float) -> None:
+        if is_in:
+            self.in_toks_ps = cur_speed if self.in_toks_ps is None else \
+                self.in_toks_ps * self.smoothing_factor + \
+                    cur_speed * (1.0 - self.smoothing_factor)
+        else:
+            self.out_toks_ps = cur_speed if self.out_toks_ps is None else \
+                self.out_toks_ps * self.smoothing_factor + \
+                    cur_speed * (1.0 - self.smoothing_factor)
 
     @torch.inference_mode()
     def generate(
@@ -135,6 +170,7 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
+        print_out: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
         Generate text sequences based on provided prompts using the language generation model.
@@ -146,6 +182,7 @@ class Llama:
             top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
             logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
             echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+            print_out (bool, optional): Flag indicating whether to print and flush each character during generation. Defaults to False.
 
         Returns:
             Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
@@ -165,17 +202,23 @@ class Llama:
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
         if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
+            token_logprobs = torch.zeros_like(tokens, dtype=torch.float, device=device)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        prev_time = time.time()
+        eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
+            cur_time = time.time()
+            self.update_inference_speed(
+                True, (cur_pos - prev_pos) / (cur_time - prev_time + 1.0e-9)
+            )
+            prev_time = cur_time
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -185,6 +228,12 @@ class Llama:
 
         for cur_pos in range(min_prompt_len, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            cur_time = time.time()
+            self.update_inference_speed(
+                cur_pos == min_prompt_len,
+                (cur_pos - prev_pos) / (cur_time - prev_time + 1.0e-9)
+            )
+            prev_time = cur_time
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -208,6 +257,14 @@ class Llama:
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+            if print_out and bsz == 1 and next_token != self.tokenizer.eos_id:
+                print(
+                    self.tokenizer.decodeIds(
+                        next_token.tolist()
+                    )[0].replace('▁', " ").replace("<0x0A>", "\n"),
+                    end='',
+                    flush=True
+                )
             if all(eos_reached):
                 break
 
@@ -238,6 +295,7 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
         echo: bool = False,
+        print_out: bool = False,
     ) -> List[CompletionPrediction]:
         """
         Perform text completion for a list of prompts using the language generation model.
@@ -250,6 +308,7 @@ class Llama:
                 If not provided, it's set to the model's maximum sequence length minus 1.
             logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
             echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+            print_out (bool, optional): Flag indicating whether to print and flush per generated token. Defaults to False.
 
         Returns:
             List[CompletionPrediction]: List of completion predictions, each containing the generated text completion.
@@ -269,6 +328,7 @@ class Llama:
             top_p=top_p,
             logprobs=logprobs,
             echo=echo,
+            print_out=print_out,
         )
         if logprobs:
             return [

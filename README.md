@@ -50,13 +50,20 @@ You can follow the steps below to quickly get up and running with Llama 2 models
 torchrun --nproc_per_node 1 example_chat_completion.py \
     --ckpt_dir llama-2-7b-chat/ \
     --tokenizer_path tokenizer.model \
-    --max_seq_len 512 --max_batch_size 6
+    --max_gen_len 2048 --max_seq_len 2048 --max_batch_size 6
 ```
 **Note**
 - Replace  `llama-2-7b-chat/` with the path to your checkpoint directory and `tokenizer.model` with the path to your tokenizer model.
 - The `–nproc_per_node` should be set to the [MP](#inference) value for the model you are using.
 - Adjust the `max_seq_len` and `max_batch_size` parameters as needed.
 - This example runs the [example_chat_completion.py](example_chat_completion.py) found in this repository but you can change that to a different .py file.
+
+7. **Note**: On M1/M2 laptops, user needs to **set PYTORCH_ENABLE_MPS_FALLBACK=1 env variable** to run this code.
+  * This is a workaround for unsupported 'aten:polar.out' operator.
+  * If you see the following message, it is expected. It falls back to CPU for that specific operation and the warning is to inform the user about it:
+_"UserWarning: The operator 'aten::polar.out' is not currently supported on the MPS backend and will fall back to run on the CPU. This may have performance implications. (Triggered internally at /private/var/folders/nz/j6p8yfhx1mv_0grj5xl4650h0000gp/T/abs_1aidzjezue/croot/pytorch_1687856425340/work/aten/src/ATen/mps/MPSFallback.mm:11.)
+freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # complex64"_
+   * We could not run on the 13B model today due to unsupported operation 'aten:all_gather_'.
 
 ## Inference
 

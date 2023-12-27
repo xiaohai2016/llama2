@@ -5,6 +5,21 @@ import fire
 
 from llama import Llama
 from typing import List
+import os
+
+import torch.distributed as dist
+import torch
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 def main(
     ckpt_dir: str,
@@ -36,33 +51,37 @@ def main(
         max_batch_size=max_batch_size,
     )
 
-    prompts: List[str] = [
-        # For these prompts, the expected answer is the natural continuation of the prompt
-        "I believe the meaning of life is",
-        "Simply put, the theory of relativity states that ",
-        """A brief message congratulating the team on the launch:
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    to_quit = False
+    inp_t = torch.zeros(max_seq_len, dtype=torch.int)
+    inp_t.share_memory_()
+    while not to_quit:
+        if local_rank == 0:
+            print(f"\n{bcolors.OKCYAN}### Question:{bcolors.ENDC} ", end='')
+            inp_i = input()
+            inp_t[:len(inp_i)] = torch.as_tensor([ord(ch) for ch in inp_i])
+            inp_t[len(inp_i):] = 0
+        dist.barrier()
+        inp = ''.join([chr(u) for u in filter(lambda x: x != 0, inp_t.tolist())])
+        if inp == "q" or inp == "x" or inp == "exit" or inp == "quit":
+            to_quit = True
+        if not to_quit:
+            prompts = [inp]
+            if local_rank == 0:
+                print(f"\n{bcolors.OKCYAN}### Answer:{bcolors.ENDC} ", end="")
+            generator.text_completion(
+                prompts,
+                max_gen_len=max_gen_len,
+                temperature=temperature,
+                top_p=top_p,
+                print_out=True,
+            )
+            if local_rank == 0:
+                print(
+                    f"\n\n  Input token speed: {bcolors.OKGREEN}{generator.in_toks_ps} tok/s{bcolors.ENDC},",
+                    f" Output token speed: {bcolors.OKCYAN}{generator.out_toks_ps} tok/s{bcolors.ENDC}."
+                )
 
-        Hi everyone,
-        
-        I just """,
-        # Few shot prompt (providing a few examples before asking model to complete more);
-        """Translate English to French:
-        
-        sea otter => loutre de mer
-        peppermint => menthe poivrée
-        plush girafe => girafe peluche
-        cheese =>""",
-    ]
-    results = generator.text_completion(
-        prompts,
-        max_gen_len=max_gen_len,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    for prompt, result in zip(prompts, results):
-        print(prompt)
-        print(f"> {result['generation']}")
-        print("\n==================================\n")
 
 
 if __name__ == "__main__":
