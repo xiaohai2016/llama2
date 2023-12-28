@@ -54,14 +54,13 @@ def main(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     to_quit = False
     inp_t = torch.zeros(max_seq_len, dtype=torch.int)
-    inp_t.share_memory_()
     while not to_quit:
         if local_rank == 0:
             print(f"\n{bcolors.OKCYAN}### Question:{bcolors.ENDC} ", end='')
             inp_i = input()
             inp_t[:len(inp_i)] = torch.as_tensor([ord(ch) for ch in inp_i])
             inp_t[len(inp_i):] = 0
-        dist.barrier()
+        dist.broadcast(inp_t, src=0)
         inp = ''.join([chr(u) for u in filter(lambda x: x != 0, inp_t.tolist())])
         if inp == "q" or inp == "x" or inp == "exit" or inp == "quit":
             to_quit = True

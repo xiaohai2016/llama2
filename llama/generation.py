@@ -93,7 +93,7 @@ class Llama:
 
         """
         if not torch.distributed.is_initialized():
-            if device == 'cuda':
+            if str(device) == 'cuda':
                 torch.distributed.init_process_group("nccl")
             else:
                 torch.distributed.init_process_group("gloo")
@@ -103,7 +103,7 @@ class Llama:
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if device == 'cuda':
+        if str(device) == 'cuda':
             torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
@@ -115,10 +115,11 @@ class Llama:
         start_time = time.time()
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
         assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-        assert model_parallel_size == len(
-            checkpoints
+        assert model_parallel_size >= len(checkpoints) and (
+            model_parallel_size % len(checkpoints) == 0
         ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-        ckpt_path = checkpoints[get_model_parallel_rank()]
+        per_pth_multiple = model_parallel_size // len(checkpoints)
+        ckpt_path = checkpoints[get_model_parallel_rank() // per_pth_multiple]
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
@@ -128,10 +129,51 @@ class Llama:
             max_batch_size=max_batch_size,
             **params,
         )
+
+        # To trim down state tensor size for current rank
+        if per_pth_multiple > 1:
+            rank_in_rank = get_model_parallel_rank() % per_pth_multiple
+            row_parallel_list = [
+                'tok_embeddings.weight', # ParallelEmbedding partitions on embedding size that is equivalent to row_parallel in tensor placement
+                'layers.0.attention.wo.weight',
+                'layers.0.feed_forward.w2.weight'
+            ]
+            column_parallel_list = [
+                'output.weight',
+                'layers.0.attention.wq.weight',
+                'layers.0.attention.wk.weight',
+                'layers.0.attention.wv.weight',
+                'layers.0.feed_forward.w1.weight',
+                'layers.0.feed_forward.w3.weight'
+            ]
+            # Pytorch weight matrix is always transposed
+            # https://github.com/pytorch/pytorch/blob/4a15f4a902c5640f3be4d18027db4316dc11d6d9/aten/src/ATen/native/Linear.cpp#L33-L40
+            split_dims = {
+                row_parallel_list[0]: 1,
+                column_parallel_list[0]: 0,
+            }
+            for layer in range(model_args.n_layers):
+                start_idx = len("layers.0")
+                for key in row_parallel_list[1:]:
+                    split_dims[f"layers.{layer}{key[start_idx:]}"] = 1
+                for key in column_parallel_list[1:]:
+                    split_dims[f"layers.{layer}{key[start_idx:]}"] = 0
+            for k, v in split_dims.items():
+                shape_ = checkpoint[k].shape
+                split_dim_size = shape_[0] if v == 0 else shape_[1]
+                assert split_dim_size % per_pth_multiple == 0
+                split_size = split_dim_size // per_pth_multiple
+                split_start = split_size * rank_in_rank
+                split_end = split_start + split_size
+                if v == 0:
+                    checkpoint[k] = checkpoint[k][split_start:split_end, :]
+                else:
+                    checkpoint[k] = checkpoint[k][:, split_start:split_end]
+
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
-        if use_cpu == 0:
-            if device == 'cuda':
+        if str(device) != 'cpu':
+            if str(device) == 'cuda':
                 torch.set_default_tensor_type(torch.cuda.HalfTensor)
             else:
                 torch.set_default_tensor_type(torch.HalfTensor)
