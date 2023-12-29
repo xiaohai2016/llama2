@@ -7,18 +7,21 @@ from multiprocessing import Queue, Process, set_start_method
 import http.server
 import json
 import os
-import signal
 from llama import Llama
 import torch.distributed as dist
+import re
 
 #-----------------Configuration section------------------
 PORT = 8000
+MASTER_PORT = 5001
 model_file = "../llama2-models/llama-2-13b-chat/"
 tokenizer_path = "../llama2-models/tokenizer.model"
-max_gen_len = 1024
-max_seq_len = 1024
+temperature = 0.3
+max_gen_len = 2048
+max_seq_len = 2048
 max_batch_size = 6
-nproc_per_node = 2
+version = int(re.compile(r'-(\d+)b-').search(model_file).group(1))
+nproc_per_node = {7: 1, 13: 2, 70: 8}[version]
 #--------------------------------------------------------
 
 def inference(request_q, response_q, local_rank, world_size, temperature: float = 0.6, top_p: float = 0.9):
@@ -26,7 +29,8 @@ def inference(request_q, response_q, local_rank, world_size, temperature: float 
     os.environ['RANK'] = str(local_rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['MASTER_ADDR'] = "127.0.0.1"
-    os.environ['MASTER_PORT'] = "5001"
+    os.environ['MASTER_PORT'] = str(MASTER_PORT)
+    os.environ['NCCL_P2P_LEVEL']='LOC' # disable P2P: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-p2p-disable
     torch.set_num_threads(1)
 
     generator = Llama.build(
@@ -34,14 +38,16 @@ def inference(request_q, response_q, local_rank, world_size, temperature: float 
         tokenizer_path=tokenizer_path,
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
+        model_parallel_size=world_size,
     )
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     to_quit = False
-    inp_t = torch.zeros(max_seq_len, dtype=torch.int)
+    buffer_size = max_seq_len * 10
+    inp_t = torch.zeros(buffer_size, dtype=torch.int)
     while not to_quit:
         if local_rank == 0:
-            inp_i = request_q.get()
+            inp_i = request_q.get()[:buffer_size - 1] # prevent overflow
             inp_t[:len(inp_i)] = torch.as_tensor([ord(ch) for ch in inp_i])
             inp_t[len(inp_i):] = 0
         dist.broadcast(inp_t, src=0)
@@ -131,7 +137,7 @@ if __name__ == "__main__":
     # runs nproc_per_node processes
     processes = []
     for idx in range(nproc_per_node):
-        p = Process(target=inference, args=(request_queue, response_queue, idx, nproc_per_node,))
+        p = Process(target=inference, args=(request_queue, response_queue, idx, nproc_per_node, temperature,))
         p.start()
         processes.append(p)
 
